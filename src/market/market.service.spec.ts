@@ -363,6 +363,109 @@ describe('MarketService — settlement orchestration', () => {
       jest.useRealTimers();
     }
   });
+
+  // Node replaces a setTimeout delay above 2^31 - 1 ms (~24.8 days) with 1ms
+  // (refs #11). Each test below both checks the outcome and that no single
+  // timer was asked for a longer delay, so it fails on the old single-timer
+  // code whether or not the fake clock reproduces Node's clamping.
+  const MAX_TIMER_DELAY_MS = 2_147_483_647;
+  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+  function longestDelay(spy: jest.SpyInstance): number {
+    return Math.max(0, ...spy.mock.calls.map((call) => Number(call[1] ?? 0)));
+  }
+
+  it('settles a market expiring more than ~24.8 days out at expiry, not right away (#11)', async () => {
+    jest.useFakeTimers();
+    const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+    try {
+      const repo = makeRepo();
+      const stellar = { settle: jest.fn().mockResolvedValue('TXHASH1'), cancel: jest.fn() };
+      const oracle = {
+        isAvailable: true,
+        waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('payload'), priceCents: undefined }),
+      };
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
+
+      const m = svc.watch(sample({ expiry: Math.floor((Date.now() + THIRTY_DAYS_MS) / 1000) }));
+      const untilExpiryMs = m.expiry * 1000 - Date.now();
+
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(stellar.settle).not.toHaveBeenCalled();
+
+      // Past the first 2^31 - 1 ms hop, still a few days before expiry.
+      await jest.advanceTimersByTimeAsync(untilExpiryMs - 60_000 - 1000);
+      expect(stellar.settle).not.toHaveBeenCalled();
+      expect(svc.get(m.contractId)?.status).toBe('watching');
+
+      // Expiry plus the 8s ledger-lag buffer.
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(stellar.settle).toHaveBeenCalledTimes(1);
+      expect(svc.get(m.contractId)?.status).toBe('settled');
+      expect(longestDelay(setTimeoutSpy)).toBeLessThanOrEqual(MAX_TIMER_DELAY_MS);
+    } finally {
+      setTimeoutSpy.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+
+  it('holds the cancel fallback until the end of a grace period longer than ~24.8 days (#11)', async () => {
+    jest.useFakeTimers();
+    const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+    try {
+      const repo = makeRepo();
+      const stellar = {
+        settle: jest.fn(),
+        cancel: jest.fn().mockResolvedValue('CANCELTX'),
+        settleViaReflector: jest.fn().mockRejectedValue(new Error('reflector stale')),
+        getMarketState: jest.fn().mockRejectedValue(new Error('rpc down')),
+      };
+      const oracle = { isAvailable: false, waitForUpdate: jest.fn() };
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
+
+      const m = svc.watch(sample({ gracePeriodSecs: THIRTY_DAYS_MS / 1000 }));
+
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(stellar.settleViaReflector).toHaveBeenCalledWith('CCONTRACT1');
+      expect(stellar.cancel).not.toHaveBeenCalled();
+
+      await jest.advanceTimersByTimeAsync(THIRTY_DAYS_MS - 60_000 - 60_000);
+      expect(stellar.cancel).not.toHaveBeenCalled();
+      expect(svc.get(m.contractId)?.status).toBe('watching');
+
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(stellar.cancel).toHaveBeenCalledWith('CCONTRACT1');
+      expect(svc.get(m.contractId)?.status).toBe('cancelled');
+      expect(longestDelay(setTimeoutSpy)).toBeLessThanOrEqual(MAX_TIMER_DELAY_MS);
+    } finally {
+      setTimeoutSpy.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+
+  it('re-arming a long-dated market drops the pending hop, so it settles once (#11)', async () => {
+    jest.useFakeTimers();
+    try {
+      const repo = makeRepo();
+      const stellar = { settle: jest.fn().mockResolvedValue('TXHASH1'), cancel: jest.fn() };
+      const oracle = {
+        isAvailable: true,
+        waitForUpdate: jest.fn().mockResolvedValue({ payload: Buffer.from('payload'), priceCents: undefined }),
+      };
+      const svc = new MarketService(repo, stellar as any, oracle as any, {} as ConfigService, new MarketEvents(), makeActivity());
+
+      const m = svc.watch(sample({ expiry: Math.floor((Date.now() + THIRTY_DAYS_MS) / 1000) }));
+      // Past the first hop, then re-arm as a process restart would.
+      await jest.advanceTimersByTimeAsync(MAX_TIMER_DELAY_MS + 60_000);
+      svc.onModuleInit();
+
+      await jest.advanceTimersByTimeAsync(THIRTY_DAYS_MS);
+      expect(stellar.settle).toHaveBeenCalledTimes(1);
+      expect(svc.get(m.contractId)?.status).toBe('settled');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
 });
 
 describe('MarketService — oracle cross-check', () => {

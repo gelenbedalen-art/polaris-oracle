@@ -42,6 +42,14 @@ const SETTLE_RETRY_DELAY_MS = 75_000;
  * `arm()`, which don't need it.
  */
 const LEDGER_LAG_BUFFER_MS = 8_000;
+/**
+ * Node stores a timer's delay as a 32-bit signed integer: any delay above
+ * 2^31 - 1 ms (~24.8 days) is replaced with 1ms, with only a
+ * TimeoutOverflowWarning on stderr. A market expiring further out than that
+ * would get its settle (or cancel) attempt almost immediately instead of at
+ * expiry, so `scheduleAt` waits in hops no longer than this.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /**
  * Owns the in-memory timer state that drives settlement automation. The
@@ -114,8 +122,7 @@ export class MarketService implements OnModuleInit {
     this.clearTimers(m.contractId);
 
     if (now < expiryMs) {
-      const timer = setTimeout(() => void this.trySettle(m), expiryMs - now + LEDGER_LAG_BUFFER_MS);
-      this.settleTimers.set(m.contractId, timer);
+      this.scheduleAt(this.settleTimers, m.contractId, expiryMs + LEDGER_LAG_BUFFER_MS, () => void this.trySettle(m));
     } else if (now < graceEndMs) {
       void this.trySettle(m);
     } else {
@@ -125,12 +132,28 @@ export class MarketService implements OnModuleInit {
 
   private scheduleCancelFallback(m: WatchedMarket): void {
     const graceEndMs = m.expiry * 1000 + m.gracePeriodSecs * 1000;
-    const delay = Math.max(0, graceEndMs + LEDGER_LAG_BUFFER_MS - Date.now());
+    const fireAtMs = graceEndMs + LEDGER_LAG_BUFFER_MS;
+    const delay = Math.max(0, fireAtMs - Date.now());
     const existing = this.cancelTimers.get(m.contractId);
     if (existing) clearTimeout(existing);
-    const timer = setTimeout(() => void this.tryCancel(m), delay);
-    this.cancelTimers.set(m.contractId, timer);
+    this.scheduleAt(this.cancelTimers, m.contractId, fireAtMs, () => void this.tryCancel(m));
     this.logger.log(`scheduled cancel fallback for ${m.contractId} in ${Math.round(delay / 1000)}s`);
+  }
+
+  /**
+   * Runs `fn` at wall-clock time `fireAtMs`. A delay longer than
+   * MAX_TIMER_DELAY_MS is split into hops: each hop that ends early schedules
+   * the next one, and stores its handle in `timers` under `contractId`, so
+   * `clearTimers` cancels the whole chain at any point.
+   */
+  private scheduleAt(timers: Map<string, NodeJS.Timeout>, contractId: string, fireAtMs: number, fn: () => void): void {
+    const delay = Math.max(0, fireAtMs - Date.now());
+    const hop = Math.min(delay, MAX_TIMER_DELAY_MS);
+    const timer = setTimeout(() => {
+      if (hop < delay) this.scheduleAt(timers, contractId, fireAtMs, fn);
+      else fn();
+    }, hop);
+    timers.set(contractId, timer);
   }
 
   private isTerminal(status: WatchedMarket['status']): boolean {
